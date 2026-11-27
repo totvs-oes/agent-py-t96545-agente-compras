@@ -61,12 +61,18 @@ class RmClient:
         return f"CODCOLIGADA={self.coligada};CODFILIAL=1;CODSISTEMA=T;CODUSUARIO={self._user}"
 
 
-    def _soap(self, action: str, dataserver: str = "", chave: str = "", xml: str = "") -> str:
+    def _soap(self, action: str, dataserver: str = "", chave: str = "", xml: str = "", filtro: str = "") -> str:
         if action == "ReadRecord":
             body = (
                 f"<tot:ReadRecord><tot:DataServerName>{dataserver}</tot:DataServerName>"
                 f"<tot:PrimaryKey>{chave}</tot:PrimaryKey>"
                 f"<tot:Contexto>{self._contexto()}</tot:Contexto></tot:ReadRecord>"
+            )
+        elif action == "ReadView":
+            body = (
+                f"<tot:ReadView><tot:DataServerName>{dataserver}</tot:DataServerName>"
+                f"<tot:Filtro>{escape(filtro)}</tot:Filtro>"
+                f"<tot:Contexto>{self._contexto()}</tot:Contexto></tot:ReadView>"
             )
         else:  # SaveRecord
             body = (
@@ -233,6 +239,16 @@ class RmClient:
             if cod_forn and linha.get("CODIGOPRD"):
                 por_codigo.setdefault(cod_forn, set()).add(linha["CODIGOPRD"])
         return {cod: next(iter(prds)) for cod, prds in por_codigo.items() if len(prds) == 1}
+
+    def comprador(self, codcomprador: str) -> dict:
+        """Nome e e-mail do comprador (TVEN, via MovVenData). E-mail pode vir vazio no cadastro."""
+        cod = re.sub(r"[^\w.-]", "", codcomprador or "")
+        xml = self._soap("ReadView", "MovVenData",
+                         filtro=f"TVEN.CODCOLIGADA={self.coligada} AND TVEN.CODVEN='{cod}'")
+        for row in ET.fromstring(xml or "<x/>"):
+            if row.tag.upper() == "TVEN":
+                return {"codigo": cod, "nome": row.findtext("NOME"), "email": row.findtext("EMAIL")}
+        return {"codigo": cod, "nome": None, "email": None}
 
     def fornecedores_cotacao(self, doc: ET.Element) -> list[dict]:
         """Fornecedores convidados (um TCORCAMENTO por fornecedor) com os dados do cadastro."""

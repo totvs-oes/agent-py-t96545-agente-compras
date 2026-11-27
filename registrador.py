@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 from extrator import extrair_proposta, transcrever_pdf
 from identificador import identificar_cotacao, identificar_fornecedor
+from notificador import enviar, montar_aviso
 from rm_client import RmClient
 from tradutor import traduzir_itens
 
@@ -99,6 +100,7 @@ def registrar(
     assunto: str = "",
     corpo: str = "",
     remetente: str = "",
+    notificar: bool = False,
 ) -> dict:
     """
     Fluxo completo: PDF → extração → identificação → tradução → gravação no RM.
@@ -112,9 +114,11 @@ def registrar(
         salvar           : False = simula, True = grava de verdade
         token            : token LLM (fallback: .env)
         assunto/corpo/remetente : dados do e-mail que trouxe a proposta, quando houver
+        notificar        : avisa o comprador (notificador.py) se houver pendência ou falha de identificação
 
-    Retorno: dict com "aprovados", "pendentes", "mudancas", "chave_rm", "identificacao" e,
-    se não deu para identificar a cotação ou o fornecedor, "erro".
+    Retorno: dict com "aprovados", "pendentes", "mudancas", "chave_rm", "identificacao",
+    "fornecedor_nome", "comprador", "aviso" (se notificou) e, se não deu para identificar
+    a cotação ou o fornecedor, "erro".
     """
     caminho = Path(caminho_pdf)
 
@@ -136,11 +140,19 @@ def registrar(
     identificacao = {"cotacao": "informada" if codcotacao else None,
                      "fornecedor": "informado" if codfornecedor else None}
     texto_pdf = transcrever_pdf(caminho) if not (codcotacao and codfornecedor) else ""
+    contexto: dict = {"identificacao": identificacao}
+
+    def _finalizar(resultado: dict) -> dict:
+        resultado = {**contexto, **resultado}
+        if notificar:
+            msg = montar_aviso(resultado, caminho, assunto_email=assunto, remetente_email=remetente)
+            if msg:
+                resultado["aviso"] = enviar(msg)
+        return resultado
 
     def _sem_identificacao(motivo: str) -> dict:
         log.error("Não foi possível identificar %s. Nada será gravado; encaminhar ao comprador.", motivo)
-        return {"aprovados": [], "pendentes": [], "mudancas": [], "chave_rm": None,
-                "identificacao": identificacao, "erro": motivo}
+        return _finalizar({"aprovados": [], "pendentes": [], "mudancas": [], "chave_rm": None, "erro": motivo})
 
     if codcotacao:
         log.info("Lendo cotação %s no RM...", codcotacao)
@@ -153,6 +165,12 @@ def registrar(
         codcotacao, doc = achado["codcotacao"], achado["doc"]
         log.info("Cotação identificada: %s (%s)", codcotacao, achado["motivo"])
 
+    contexto["codcotacao"] = codcotacao
+    try:
+        contexto["comprador"] = rm.comprador(doc.find("TCCOTACAO").findtext("CODCOMPRADOR"))
+    except Exception as e:
+        log.warning("Não foi possível ler o comprador da cotação: %s", e)
+
     if not codfornecedor:
         achado = identificar_fornecedor(rm.fornecedores_cotacao(doc), proposta=proposta, texto_pdf=texto_pdf,
                                         remetente=remetente, corpo=corpo)
@@ -163,6 +181,10 @@ def registrar(
         codfornecedor = achado["codcfo"]
         log.info("Fornecedor identificado: %s %s (%.2f: %s)", codfornecedor, achado["nome"], achado["score"],
                  achado["motivo"])
+
+    contexto["codfornecedor"] = codfornecedor
+    contexto["fornecedor_nome"] = next((f["nome"] for f in rm.fornecedores_cotacao(doc)
+                                        if f["codcfo"] == codfornecedor), None)
 
     itens_rm = rm.itens_cotacao(doc)
 
@@ -203,8 +225,7 @@ def registrar(
 
     if not aprovados:
         log.error("Nenhum item aprovado na tradução. Nada será gravado")
-        return {"aprovados": [], "pendentes": pendentes, "mudancas": [], "chave_rm": None,
-                "identificacao": identificacao, "codcotacao": codcotacao, "codfornecedor": codfornecedor}
+        return _finalizar({"aprovados": [], "pendentes": pendentes, "mudancas": [], "chave_rm": None})
 
 
     # Aplica alterações no XML
@@ -251,15 +272,12 @@ def registrar(
         chave_rm = rm.salvar_cotacao(doc)
         log.info("Gravando. Chave RM: %s", chave_rm)
 
-    return {
+    return _finalizar({
         "aprovados": aprovados,
         "pendentes": pendentes,
         "mudancas": mudancas,
         "chave_rm": chave_rm,
-        "identificacao": identificacao,
-        "codcotacao": codcotacao,
-        "codfornecedor": codfornecedor,
-    }
+    })
 
 
 
@@ -277,6 +295,7 @@ if __name__ == "__main__":
     p.add_argument("--remetente",   default="", help="e-mail do remetente")
     p.add_argument("--coligada",    type=int, default=42)
     p.add_argument("--salvar",      action="store_true", help="grava de verdade")
+    p.add_argument("--notificar",   action="store_true", help="avisa o comprador se houver pendência")
     a = p.parse_args()
 
     resultado = registrar(
@@ -288,7 +307,11 @@ if __name__ == "__main__":
         assunto=a.assunto,
         corpo=a.corpo,
         remetente=a.remetente,
+        notificar=a.notificar,
     )
+
+    if resultado.get("aviso"):
+        print(f"\nAviso ao comprador: {resultado['aviso']}")
 
     if resultado.get("erro"):
         print(f"\nNÃO IDENTIFICADO: {resultado['erro']} — encaminhar ao comprador")
