@@ -35,8 +35,36 @@ def _fator_financeiro(dias: int | None) -> float:
     return (1 + TAXA_MENSAL) ** ((PRAZO_PAGTO_PADRAO - dias) / 30)
 
 
-def montar_quadro(doc) -> dict:
-    """Lê a cotação (XML do CmpCotacaoData) e monta o quadro equalizado com a sugestão."""
+def _comparar_ultima_compra(item: dict, historico: list[dict]) -> None:
+    """Compara o preço de material da melhor proposta com o último pedido aprovado do produto."""
+    if not historico:
+        item["ultima_compra"] = None
+        return
+    u = historico[0]
+    data = datetime.fromisoformat(str(u["DATAEMISSAO"])[:19])
+    item["ultima_compra"] = {
+        "data": data, "preco": _f(u.get("PRECOUNITARIO")), "unidade": u.get("CODUND"),
+        "fornecedor": (u.get("NOMEFANTASIA") or u.get("CODCFO") or "").strip(), "coligada": u.get("CODCOLIGADA"),
+        "variacao": None,
+    }
+    if not item["propostas"] or item["ultima_compra"]["preco"] <= 0:
+        return
+    if (u.get("CODUND") or "").upper() != (item["unidade"] or "").upper():
+        item["alertas"].append(f"última compra em outra unidade ({u.get('CODUND')}); sem comparação")
+        return
+    melhor = item["propostas"][0]["preco"]
+    variacao = melhor / item["ultima_compra"]["preco"] - 1
+    item["ultima_compra"]["variacao"] = variacao
+    if abs(variacao) > FAIXA_DESVIO:
+        item["alertas"].append(f"preço da melhor proposta {variacao:+.0%} em relação à última compra "
+                               f"(faixa {FAIXA_DESVIO:.0%})")
+
+
+def montar_quadro(doc, historico: dict[str, list[dict]] | None = None) -> dict:
+    """
+    Lê a cotação (XML do CmpCotacaoData) e monta o quadro equalizado com a sugestão.
+    historico: {IDPRD: últimas compras do produto}, vindo de RmClient.ultimas_compras.
+    """
     cab = doc.find("TCCOTACAO")
     data_cot = datetime.fromisoformat(cab.findtext("DATCOTACAO"))
     necessidade = cab.findtext("DATENTREGA")
@@ -77,14 +105,16 @@ def montar_quadro(doc) -> dict:
         chave = (r.findtext("IDMOV"), r.findtext("NSEQITMMOV"))
         if r.findtext("STSITEM") != "0" or preco <= 0 or chave not in itens:
             continue
-        qtd = _f(r.findtext("QUANTIDADEORC")) or itens[chave]["quantidade"]
+        # Equaliza sempre sobre a quantidade pedida; a orçada só gera alerta se for diferente
+        qtd = itens[chave]["quantidade"]
+        qtd_orc = _f(r.findtext("QUANTIDADEORC"))
         prazo = int(_f(r.findtext("PRAZOENTREGA"), -1))
-        linhas.append((chave, r.findtext("CODCFO"), preco, qtd, prazo))
+        linhas.append((chave, r.findtext("CODCFO"), preco, qtd, qtd_orc, prazo))
     material_por_cfo = {}
-    for _, cfo, preco, qtd, _ in linhas:
+    for _, cfo, preco, qtd, _, _ in linhas:
         material_por_cfo[cfo] = material_por_cfo.get(cfo, 0) + preco * qtd
 
-    for chave, cfo, preco, qtd, prazo in linhas:
+    for chave, cfo, preco, qtd, qtd_orc, prazo in linhas:
         forn = fornecedores.get(cfo, {"codcfo": cfo, "nome": cfo, "frete_valor": 0, "frete_tipo": None,
                                       "dias_pagto": None, "cpg": None, "prazo": -1})
         item = itens[chave]
@@ -92,6 +122,9 @@ def montar_quadro(doc) -> dict:
         frete = forn["frete_valor"] * material / material_por_cfo[cfo] if material_por_cfo.get(cfo) else 0
         prazo = prazo if prazo >= 0 else forn["prazo"]
         alertas = []
+        if qtd_orc and qtd and abs(qtd_orc - qtd) / qtd > 0.10:
+            alertas.append(f"quantidade orçada no RM ({_br(qtd_orc)}) diferente da pedida ({_br(qtd)}); "
+                           "comparado pela pedida")
         if forn["frete_tipo"] is None and not forn["frete_valor"]:
             alertas.append("frete não informado")
         if prazo < 0:
@@ -137,6 +170,8 @@ def montar_quadro(doc) -> dict:
             if abs(desvio) > FAIXA_DESVIO:
                 item["alertas"].append(f"melhor custo {desvio:+.0%} em relação ao preço de referência "
                                        f"(faixa {FAIXA_DESVIO:.0%})")
+        if historico is not None:
+            _comparar_ultima_compra(item, historico.get(item["idprd"]) or [])
 
     return {
         "codcotacao": cab.findtext("CODCOTACAO"),
@@ -175,7 +210,13 @@ def _sugerir(julgamento: str, itens: list[dict], fornecedores: dict) -> dict:
 def equalizar(codcotacao: str, coligada: int = 42) -> dict:
     rm = RmClient(coligada)
     doc = rm.ler_cotacao(codcotacao)
-    quadro = montar_quadro(doc)
+    historico = {}
+    for idprd in {it.findtext("IDPRD") for it in doc.findall("TCCOTACAOITMMOV")}:
+        try:
+            historico[idprd] = rm.ultimas_compras(idprd)
+        except Exception:
+            historico[idprd] = []
+    quadro = montar_quadro(doc, historico)
     try:
         quadro["comprador"] = rm.comprador(doc.find("TCCOTACAO").findtext("CODCOMPRADOR"))
     except Exception:
@@ -202,6 +243,15 @@ def texto_quadro(q: dict) -> str:
                           f"{p['prazo'] if p['prazo'] >= 0 else '?'}d  {p['cpg'] or '?'}  {p['frete_tipo'] or '?'}")
             for a in p["alertas"]:
                 linhas.append(f"        ! {a}")
+        u = it.get("ultima_compra")
+        if u:
+            meses = (q["data_cotacao"] - u["data"]).days // 30
+            idade = f", há {meses} meses" if meses >= 12 else ""
+            var = f" — melhor proposta {u['variacao']:+.1%}".replace(".", ",") if u["variacao"] is not None else ""
+            linhas.append(f"    Última compra: R$ {_br(u['preco'], 4)}/{u['unidade']} em {u['data']:%d/%m/%Y}{idade} "
+                          f"({u['fornecedor'][:30]}, coligada {u['coligada']}){var}")
+        elif "ultima_compra" in it:
+            linhas.append("    Última compra: nenhum pedido aprovado deste produto")
         for a in it["alertas"]:
             linhas.append(f"    ATENÇÃO: {a}")
         linhas.append("")

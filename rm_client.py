@@ -238,6 +238,10 @@ class RmClient:
             raise RuntimeError(f"Consulta SQL {codigo} falhou [{r.status_code}]: {r.text[:300]}")
         return r.json()
 
+    def ultimas_compras(self, idprd: str) -> list[dict]:
+        """Até 5 pedidos de compra aprovados (1.1.15) do produto, em todas as coligadas, do mais recente."""
+        return self.consulta_sql("AG2_ULT_COMPRA", {"IDPRD": idprd})
+
     def traducoes_fornecedor(self, codfornecedor: str) -> dict[str, str]:
         """
         De-para código do produto no fornecedor -> CODIGOPRD do RM (tabela TPRDCFOCOLAB,
