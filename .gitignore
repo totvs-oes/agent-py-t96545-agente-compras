@@ -126,6 +126,9 @@ celerybeat.pid
 # Avisos gerados pelo notificador (levam a proposta do fornecedor em anexo)
 avisos/
 
+# Caixa local do agente2.py (e-mails de fornecedores, processados e estado.json)
+caixa/
+
 # Environments
 .env
 .venv
