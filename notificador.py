@@ -138,6 +138,26 @@ def montar_aviso(resultado: dict, caminho_pdf: str | Path, *, assunto_email: str
     return msg
 
 
+def aviso_quadro(quadro: dict, texto: str) -> EmailMessage:
+    """E-mail com o quadro comparativo e a sugestão de vencedor da cotação."""
+    comprador = quadro.get("comprador") or {}
+    saudacao = f"Olá, {comprador['nome'].split()[0].title()}," if comprador.get("nome") else "Olá,"
+    corpo = "\n".join([
+        saudacao, "",
+        f"Todas as propostas da cotação {quadro['codcotacao']} registradas até agora foram equalizadas "
+        "(preço + frete rateado). Segue o quadro comparativo com a sugestão do agente. "
+        "Nada foi alterado no RM: a escolha do vencedor é sua.", "",
+        texto, "",
+        "— Agente de Compras IBEN (mensagem automática)",
+    ])
+    msg = EmailMessage()
+    msg["Subject"] = f"[Agente de Compras] Cotação {quadro['codcotacao']}: quadro comparativo e sugestão"
+    msg["From"] = _REMETENTE
+    msg["To"] = _destinatario(comprador)
+    msg.set_content(corpo)
+    return msg
+
+
 def _destinatario(comprador: dict) -> str:
     # Em teste o aviso nunca vai para o comprador real: NOTIFICAR_PARA tem prioridade
     return os.environ.get("NOTIFICAR_PARA") or (comprador or {}).get("email") or "comprador-nao-cadastrado@invalido"
