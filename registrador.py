@@ -5,7 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
-from extrator import extrair_proposta
+from extrator import extrair_proposta, transcrever_pdf
+from identificador import identificar_cotacao, identificar_fornecedor
 from rm_client import RmClient
 from tradutor import traduzir_itens
 
@@ -89,26 +90,31 @@ def _resumo_observacao(proposta: dict) -> str | None:
 
 def registrar(
     caminho_pdf: str | Path,
-    codcotacao: str,
-    codfornecedor: str,
+    codcotacao: str | None = None,
+    codfornecedor: str | None = None,
     coligada: int = 42,
     tabela_traducao: dict[str, str] | None = None,
     salvar: bool = False,
     token: str | None = None,
+    assunto: str = "",
+    corpo: str = "",
+    remetente: str = "",
 ) -> dict:
     """
-    Fluxo completo: PDF → extração → tradução → gravação no RM.
+    Fluxo completo: PDF → extração → identificação → tradução → gravação no RM.
 
     Parâmetros:
         caminho_pdf      : caminho local do PDF da proposta
-        codcotacao       : ex. "2026.000401"
-        codfornecedor    : ex. "0018740"
+        codcotacao       : ex. "2026.000401"; se None, é identificada pelo assunto/corpo/arquivo/PDF
+        codfornecedor    : ex. "0018740"; se None, é identificado entre os convidados da cotação
         coligada         : padrão 42
-        tabela_traducao  : dict {cod_forn_upper: CODIGOPRD_rm} de TPRDCFOCOLAB
+        tabela_traducao  : dict {cod_forn_upper: CODIGOPRD_rm}; se None, é carregada da TPRDCFOCOLAB
         salvar           : False = simula, True = grava de verdade
         token            : token LLM (fallback: .env)
+        assunto/corpo/remetente : dados do e-mail que trouxe a proposta, quando houver
 
-    Retorno: dict com chaves "aprovados", "pendentes", "mudancas", "chave_rm"
+    Retorno: dict com "aprovados", "pendentes", "mudancas", "chave_rm", "identificacao" e,
+    se não deu para identificar a cotação ou o fornecedor, "erro".
     """
     caminho = Path(caminho_pdf)
 
@@ -126,11 +132,38 @@ def registrar(
         proposta.get("condicao_pagamento"),
     )
 
-    # Leio cotação do RM
-    log.info("Lendo cotação %s no RM...", codcotacao)
-
     rm = RmClient(coligada=coligada)
-    doc = rm.ler_cotacao(codcotacao)
+    identificacao = {"cotacao": "informada" if codcotacao else None,
+                     "fornecedor": "informado" if codfornecedor else None}
+    texto_pdf = transcrever_pdf(caminho) if not (codcotacao and codfornecedor) else ""
+
+    def _sem_identificacao(motivo: str) -> dict:
+        log.error("Não foi possível identificar %s. Nada será gravado; encaminhar ao comprador.", motivo)
+        return {"aprovados": [], "pendentes": [], "mudancas": [], "chave_rm": None,
+                "identificacao": identificacao, "erro": motivo}
+
+    if codcotacao:
+        log.info("Lendo cotação %s no RM...", codcotacao)
+        doc = rm.ler_cotacao(codcotacao)
+    else:
+        achado = identificar_cotacao(rm, assunto=assunto, corpo=corpo, nome_arquivo=caminho.name, texto_pdf=texto_pdf)
+        identificacao["cotacao"] = achado["motivo"]
+        if not achado["codcotacao"]:
+            return _sem_identificacao(f"a cotação ({achado['motivo']})")
+        codcotacao, doc = achado["codcotacao"], achado["doc"]
+        log.info("Cotação identificada: %s (%s)", codcotacao, achado["motivo"])
+
+    if not codfornecedor:
+        achado = identificar_fornecedor(rm.fornecedores_cotacao(doc), proposta=proposta, texto_pdf=texto_pdf,
+                                        remetente=remetente, corpo=corpo)
+        identificacao["fornecedor"] = achado["motivo"]
+        identificacao["ranking_fornecedores"] = achado["ranking"]
+        if not achado["codcfo"]:
+            return _sem_identificacao(f"o fornecedor ({achado['motivo']})")
+        codfornecedor = achado["codcfo"]
+        log.info("Fornecedor identificado: %s %s (%.2f: %s)", codfornecedor, achado["nome"], achado["score"],
+                 achado["motivo"])
+
     itens_rm = rm.itens_cotacao(doc)
 
     log.info("Cotação lida: %d item(ns) no RM", len(itens_rm))
@@ -170,7 +203,8 @@ def registrar(
 
     if not aprovados:
         log.error("Nenhum item aprovado na tradução. Nada será gravado")
-        return {"aprovados": [], "pendentes": pendentes, "mudancas": [], "chave_rm": None}
+        return {"aprovados": [], "pendentes": pendentes, "mudancas": [], "chave_rm": None,
+                "identificacao": identificacao, "codcotacao": codcotacao, "codfornecedor": codfornecedor}
 
 
     # Aplica alterações no XML
@@ -222,6 +256,9 @@ def registrar(
         "pendentes": pendentes,
         "mudancas": mudancas,
         "chave_rm": chave_rm,
+        "identificacao": identificacao,
+        "codcotacao": codcotacao,
+        "codfornecedor": codfornecedor,
     }
 
 
@@ -233,8 +270,11 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="Registra proposta de fornecedor na cotação do RM")
     p.add_argument("pdf",           help="caminho do PDF da proposta")
-    p.add_argument("--cotacao",     required=True, help="ex: 2026.000401")
-    p.add_argument("--fornecedor",  required=True, help="ex: 0018740")
+    p.add_argument("--cotacao",     help="ex: 2026.000401 (sem isso, identifica sozinho)")
+    p.add_argument("--fornecedor",  help="ex: 0018740 (sem isso, identifica entre os convidados)")
+    p.add_argument("--assunto",     default="", help="assunto do e-mail da proposta")
+    p.add_argument("--corpo",       default="", help="corpo do e-mail da proposta")
+    p.add_argument("--remetente",   default="", help="e-mail do remetente")
     p.add_argument("--coligada",    type=int, default=42)
     p.add_argument("--salvar",      action="store_true", help="grava de verdade")
     a = p.parse_args()
@@ -245,9 +285,20 @@ if __name__ == "__main__":
         codfornecedor=a.fornecedor,
         coligada=a.coligada,
         salvar=a.salvar,
+        assunto=a.assunto,
+        corpo=a.corpo,
+        remetente=a.remetente,
     )
 
-    print(f"\nAprovados : {len(resultado['aprovados'])}")
+    if resultado.get("erro"):
+        print(f"\nNÃO IDENTIFICADO: {resultado['erro']} — encaminhar ao comprador")
+        for r in resultado["identificacao"].get("ranking_fornecedores", []):
+            print(f"  {r['codcfo']} {r['nome']}: {r['score']:.2f} {r['motivo']}")
+        raise SystemExit(1)
+
+    print(f"\nCotação   : {resultado['codcotacao']} ({resultado['identificacao']['cotacao']})")
+    print(f"Fornecedor: {resultado['codfornecedor']} ({resultado['identificacao']['fornecedor']})")
+    print(f"Aprovados : {len(resultado['aprovados'])}")
     print(f"Pendentes : {len(resultado['pendentes'])}")
     print(f"Mudanças  : {len(resultado['mudancas'])}")
     if resultado["chave_rm"]:

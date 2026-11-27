@@ -234,6 +234,19 @@ class RmClient:
                 por_codigo.setdefault(cod_forn, set()).add(linha["CODIGOPRD"])
         return {cod: next(iter(prds)) for cod, prds in por_codigo.items() if len(prds) == 1}
 
+    def fornecedores_cotacao(self, doc: ET.Element) -> list[dict]:
+        """Fornecedores convidados (um TCORCAMENTO por fornecedor) com os dados do cadastro."""
+        return [
+            {
+                "codcfo": o.findtext("CODCFO"),
+                "nome": o.findtext("NOMEFANTASIA") or o.findtext("NOME"),
+                "cnpj": o.findtext("CGCCFO"),
+                "email": o.findtext("EMAIL"),
+                "telefone": o.findtext("TELEFONE") or o.findtext("TELCONTATO"),
+            }
+            for o in doc.findall("TCORCAMENTO")
+        ]
+
     def itens_cotacao(self, doc: ET.Element) -> list[dict]:
         """Retorna os itens da cotação como lista de dicts (código, descrição, quantidade, unidade, preço ref.)"""
         return [
