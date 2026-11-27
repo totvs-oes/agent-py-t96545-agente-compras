@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from extrator import extrair_proposta, transcrever_pdf
 from identificador import identificar_cotacao, identificar_fornecedor
 from notificador import enviar, montar_aviso
+from pagamento import codcpg_para, dias_do_texto
 from rm_client import RmClient
 from tradutor import traduzir_itens
 
@@ -78,6 +79,68 @@ def _dias(proposta: dict, campo: str, data_cotacao: datetime) -> int | None:
         log.warning("%s_data %s é anterior à data da cotação %s; ignorado", campo, data, data_cotacao.date())
         return None
     return delta
+
+
+_FRETE_RM = {k.strip(): int(v) for k, v in
+             (par.split("=") for par in os.environ.get("FRETE_CODIGOS", "CIF=1,FOB=2,SEM_FRETE=9").split(","))}
+
+
+def _codcpg(rm: RmClient, proposta: dict) -> str | None:
+    texto = proposta.get("condicao_pagamento")
+    dias = proposta.get("condicao_pagamento_dias") or dias_do_texto(texto)
+    try:
+        cpg = codcpg_para(dias, rm.condicoes_pagamento())
+    except Exception as e:
+        log.warning("Não foi possível ler as condições de pagamento do RM: %s", e)
+        return None
+    if cpg:
+        log.info("Condição de pagamento %r (dias %s) -> CODCPG %s %s", texto, dias, cpg["codcpg"], cpg["nome"])
+        return cpg["codcpg"]
+    if texto or dias:
+        log.warning("Condição de pagamento %r (dias %s) sem correspondência no RM; fica só na observação", texto, dias)
+    return None
+
+
+def _frete_por_itens(itens: list[dict]) -> float | None:
+    """Soma frete_unitario × quantidade; só vale se todos os itens tiverem os dois."""
+    total = 0.0
+    for it in itens:
+        try:
+            total += float(it["frete_unitario"]) * float(it["quantidade"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return round(total, 2) if itens and total > 0 else None
+
+
+def _frete(proposta: dict) -> tuple[int | None, float | None]:
+    tipo = proposta.get("frete_tipo")
+    valor = proposta.get("frete_valor_total")
+    try:
+        valor = float(valor) if valor is not None else None
+    except (TypeError, ValueError):
+        valor = None
+    if valor is not None and valor <= 0:
+        valor = None
+
+    # Frete por unidade em cada linha é mais confiável que o total lido pelo LLM, que pode
+    # pegar o frete de uma viagem só ("R$ 1.280 por viagem")
+    calculado = _frete_por_itens(proposta.get("itens") or [])
+    if calculado and (not valor or abs(calculado - valor) / calculado > 0.05):
+        if valor:
+            log.warning("Frete total lido (R$ %.2f) difere da soma por item (R$ %.2f); usando a soma", valor, calculado)
+        valor = calculado
+    if tipo == "SEM_FRETE" and valor:
+        log.warning("Proposta diz 'sem frete' mas traz frete de R$ %.2f; frete não gravado", valor)
+        return None, None
+    material = sum(float(it.get("preco_unitario") or 0) * float(it.get("quantidade") or 0)
+                   for it in proposta.get("itens") or [])
+    if valor and material and valor < 0.005 * material:
+        log.warning("Frete de R$ %.2f é desprezível frente ao material (R$ %.2f); provável leitura errada, "
+                    "não gravado", valor, material)
+        valor = None
+    if valor and not tipo:
+        tipo = "CIF"  # frete cobrado pelo fornecedor à parte do material
+    return _FRETE_RM.get(tipo) if tipo else None, valor
 
 
 def _resumo_observacao(proposta: dict) -> str | None:
@@ -238,7 +301,10 @@ def registrar(
         log.warning("Contato extraído parece ser da IBEN (%r); mantido o contato do cadastro", contato)
         contato = None
 
-    #Cabecalho do orçamento (prazo, validade, contato, num_orc) - sem preco global
+    codcpg = _codcpg(rm, proposta)
+    frete_cif_fob, valor_frete = _frete(proposta)
+
+    #Cabecalho do orçamento (prazo, validade, contato, num_orc, pagamento, frete) - sem preco global
     mudancas += rm.aplicar_orcamento(
         doc,
         fornecedor=codfornecedor,
@@ -248,6 +314,9 @@ def registrar(
         contato=contato,
         num_orcamento=proposta.get("num_orcamento"),
         observacao=_resumo_observacao(proposta),
+        codcpg=codcpg,
+        frete_cif_fob=frete_cif_fob,
+        valor_frete=valor_frete,
     )
 
     #Precos por item (somente os aprovados na tradução), convertidos para a unidade do RM

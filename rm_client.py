@@ -134,6 +134,9 @@ class RmClient:
             contato: str | None = None,
             num_orcamento: str | None = None,
             observacao: str | None = None,
+            codcpg: str | None = None,
+            frete_cif_fob: int | None = None,
+            valor_frete: float | None = None,
     ) -> list[str]:
         """
         Altera somente as linhas do fornecedor informado no XML da cotação.
@@ -171,6 +174,15 @@ class RmClient:
 
             if observacao:
                 self._set(row, "TXTOBSERVACAO", observacao, mud, k)
+
+            if codcpg:
+                self._set(row, "CODCPG", codcpg, mud, k)
+
+            if frete_cif_fob is not None:
+                self._set(row, "FRETECIFOUFOB", frete_cif_fob, mud, k)
+
+            if valor_frete is not None:
+                self._set(row, "VALORFRETE", f"{valor_frete:.4f}", mud, k)
 
         for tabela in ("TCITMORCAMENTO", "TCITMORCAMENTOAGRUPADO"):
             for row in doc.findall(tabela):
@@ -239,6 +251,18 @@ class RmClient:
             if cod_forn and linha.get("CODIGOPRD"):
                 por_codigo.setdefault(cod_forn, set()).add(linha["CODIGOPRD"])
         return {cod: next(iter(prds)) for cod, prds in por_codigo.items() if len(prds) == 1}
+
+    def condicoes_pagamento(self) -> list[dict]:
+        """Condições de pagamento ativas da coligada (TCPG, via MovCPGData)."""
+        xml = self._soap("ReadView", "MovCPGData", filtro=f"TCPG.CODCOLIGADA={self.coligada}")
+        vistos, saida = set(), []
+        for row in ET.fromstring(xml or "<x/>"):
+            cod = row.findtext("CODCPG")
+            if row.tag.upper() != "TCPG" or cod in vistos or row.findtext("INATIVO") == "1":
+                continue
+            vistos.add(cod)
+            saida.append({"codcpg": cod, "nome": (row.findtext("NOME") or "").strip()})
+        return saida
 
     def comprador(self, codcomprador: str) -> dict:
         """Nome e e-mail do comprador (TVEN, via MovVenData). E-mail pode vir vazio no cadastro."""

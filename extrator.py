@@ -23,6 +23,15 @@ _PROMPT = (
     "nunca use o nome ou e-mail do cliente (comprador, obra, IBEN). "
     "Em fornecedor, preencha os dados da empresa que EMITE a proposta (razão social, CNPJ, e-mail, telefone), "
     "nunca os do cliente. "
+    "condicao_pagamento_dias: lista com os dias de cada parcela a partir do faturamento "
+    "(ex.: '28 dias' -> [28]; '30/60/90 DDL' -> [30, 60, 90]; 'à vista' -> [0]; 'entrada + 30' -> [0, 30]); "
+    "null se não informado. Se houver prazos diferentes para material e frete, use o do material. "
+    "frete_tipo: CIF se o fornecedor entrega/paga o frete (incluso ou cobrado à parte), FOB se o cliente retira ou "
+    "paga o frete à transportadora, SEM_FRETE se não há frete; null se o documento não diz. "
+    "frete_valor_total: valor total em reais do frete cobrado à parte do preço do material (somando todas as "
+    "linhas e cargas); null se o frete estiver embutido no preço ou não for informado. "
+    "Se o frete vier por unidade em cada linha (ex.: coluna 'R$ Frete' por milheiro), preencha frete_unitario do item, "
+    "na mesma unidade do preco_unitario; não confunda com frete por viagem/carga. "
     "Preencha prazo_entrega somente se o documento disser explicitamente o prazo de ENTREGA do material; "
     "não use prazo de pagamento (ex.: '30 DD', '15 DD' do frete), validade nem prazo de faturamento. "
     "Prazo de entrega e validade: se o documento informar em dias, preencha os campos *_dias; "
@@ -50,6 +59,9 @@ _SCHEMA = json.dumps({
         "validade_dias": {"type": ["integer", "null"]},
         "validade_data": {"type": ["string", "null"], "format": "date"},
         "frete": {"type": ["string", "null"]},
+        "frete_tipo": {"type": ["string", "null"], "enum": ["CIF", "FOB", "SEM_FRETE", None]},
+        "frete_valor_total": {"type": ["number", "null"]},
+        "condicao_pagamento_dias": {"type": ["array", "null"], "items": {"type": "integer"}},
         "itens": {
             "type": "array",
             "items": {
@@ -61,6 +73,7 @@ _SCHEMA = json.dumps({
                     "unidade":             {"type": ["string", "null"]},
                     "preco_unitario":      {"type": ["number", "null"]},
                     "valor_total":         {"type": ["number", "null"]},
+                    "frete_unitario":      {"type": ["number", "null"]},
                 },
                 "required": ["descricao_fornecedor", "preco_unitario"],
             },
